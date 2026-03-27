@@ -1,18 +1,21 @@
-# Project 1 — JWKS Server (Go)
+# Project 2 - SQLite-backed JWKS Server
 
-## What this does
-- Generates RSA key pairs with unique `kid` and expiry timestamps.
-- Serves a JWKS endpoint with ONLY non-expired public keys.
-- Provides `/auth` endpoint to issue JWTs.
-- Supports `?expired=true` to issue JWT signed with an expired key and expired exp.
+## Features
+- Stores RSA private keys in SQLite
+- Uses parameterized SQL queries to avoid SQL injection
+- Serves valid public keys at `GET /.well-known/jwks.json`
+- Issues JWTs at `POST /auth`
+- Supports expired JWT issuance with `POST /auth?expired=true`
 
-## Endpoints
-- `GET /jwks`
-- `GET /.well-known/jwks.json`
-- `POST /auth`
-- `POST /auth?expired=true`
+## DB file
+The server creates:
 
-## Run
-```bash
-go mod tidy
-go run .
+`totally_not_my_privateKeys.db`
+
+## Table schema
+```sql
+CREATE TABLE IF NOT EXISTS keys(
+    kid INTEGER PRIMARY KEY AUTOINCREMENT,
+    key BLOB NOT NULL,
+    exp INTEGER NOT NULL
+)

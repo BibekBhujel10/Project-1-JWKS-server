@@ -1,46 +1,109 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"jwks-server/internal/jwks"
+	dbpkg "jwks-server/internal/db"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// parseWithoutClaimsValidation verifies signature + algorithm without enforcing exp/nbf/iat.
-// This is important because:
-// - For expired tokens, we EXPECT exp to be in the past but still want signature verification.
-// - It also prevents flaky failures due to clock skew when exp is close to "now".
-func parseWithoutClaimsValidation(t *testing.T, tokenStr string, pub any) *jwt.Token {
+func setupTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	database, err := dbpkg.OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := dbpkg.InitSchema(database); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC).Unix()
+
+	expiredPEM, err := dbpkg.GeneratePEMKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validPEM, err := dbpkg.GeneratePEMKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := dbpkg.InsertKey(database, expiredPEM, now-3600); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbpkg.InsertKey(database, validPEM, now+3600); err != nil {
+		t.Fatal(err)
+	}
+
+	return database
+}
+
+func parseWithoutClaimsValidation(t *testing.T, tokenStr string, publicKey any) *jwt.Token {
 	t.Helper()
 
 	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
 
-	parsed, err := parser.Parse(tokenStr, func(token *jwt.Token) (any, error) {
-		return pub, nil
+	token, err := parser.Parse(tokenStr, func(token *jwt.Token) (any, error) {
+		return publicKey, nil
 	})
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if !parsed.Valid {
-		t.Fatalf("expected valid signature")
+
+	if !token.Valid {
+		t.Fatal("expected valid signature")
 	}
-	return parsed
+
+	return token
+}
+
+func TestJWKSReturnsOnlyValidKeys(t *testing.T) {
+	database := setupTestDB(t)
+	defer database.Close()
+
+	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC)
+
+	s := NewServer(database)
+	s.now = func() time.Time { return now }
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
+	rr := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, ok := body["keys"].([]any)
+	if !ok {
+		t.Fatal(`expected "keys" array`)
+	}
+
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 valid key, got %d", len(keys))
+	}
 }
 
 func TestJWKSMethodNotAllowed(t *testing.T) {
-	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC)
+	database := setupTestDB(t)
+	defer database.Close()
 
-	ks, _ := jwks.NewKeySet(jwks.KeySpec{ExpiresAt: now.Add(1 * time.Hour)})
-	s := NewServer(ks)
-	s.now = func() time.Time { return now }
+	s := NewServer(database)
 
-	req := httptest.NewRequest(http.MethodPost, "/jwks", nil)
+	req := httptest.NewRequest(http.MethodPost, "/.well-known/jwks.json", nil)
 	rr := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rr, req)
 
@@ -49,42 +112,13 @@ func TestJWKSMethodNotAllowed(t *testing.T) {
 	}
 }
 
-func TestJWKSReturnsOK(t *testing.T) {
+func TestAuthReturnsValidJWT(t *testing.T) {
+	database := setupTestDB(t)
+	defer database.Close()
+
 	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC)
 
-	ks, _ := jwks.NewKeySet(
-		jwks.KeySpec{ExpiresAt: now.Add(1 * time.Hour)},  // active
-		jwks.KeySpec{ExpiresAt: now.Add(-1 * time.Hour)}, // expired
-	)
-	s := NewServer(ks)
-	s.now = func() time.Time { return now }
-
-	req := httptest.NewRequest(http.MethodGet, "/jwks", nil)
-	rr := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
-
-	// Should return JSON with "keys"
-	var doc map[string]any
-	if err := json.NewDecoder(rr.Body).Decode(&doc); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if _, ok := doc["keys"]; !ok {
-		t.Fatalf(`expected "keys" in JWKS response`)
-	}
-}
-
-func TestAuthIssuesValidJWT(t *testing.T) {
-	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC)
-
-	ks, _ := jwks.NewKeySet(
-		jwks.KeySpec{ExpiresAt: now.Add(30 * time.Minute)},  // active
-		jwks.KeySpec{ExpiresAt: now.Add(-30 * time.Minute)}, // expired
-	)
-	s := NewServer(ks)
+	s := NewServer(database)
 	s.now = func() time.Time { return now }
 
 	req := httptest.NewRequest(http.MethodPost, "/auth", nil)
@@ -95,50 +129,35 @@ func TestAuthIssuesValidJWT(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
 
-	var body struct {
-		Token string `json:"token"`
-	}
+	var body map[string]string
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Token == "" {
-		t.Fatalf("expected token")
+		t.Fatal(err)
 	}
 
-	active, ok := ks.ActiveKey(now)
-	if !ok {
-		t.Fatalf("expected active key")
+	record, err := dbpkg.GetValidKey(database, now.Unix())
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	parsed := parseWithoutClaimsValidation(t, body.Token, active.Public)
-
-	kid, _ := parsed.Header["kid"].(string)
-	if kid != active.KID {
-		t.Fatalf("expected kid %s, got %s", active.KID, kid)
+	privateKey, err := dbpkg.ParsePrivateKeyFromPEM(record.PEM)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Optional: check exp equals active key expiry (matches your server logic)
-	claims, ok := parsed.Claims.(jwt.MapClaims)
-	if !ok {
-		t.Fatalf("expected MapClaims")
-	}
-	expVal, ok := claims["exp"].(float64)
-	if !ok {
-		t.Fatalf("expected exp claim")
-	}
-	if int64(expVal) != active.ExpiresAt.Unix() {
-		t.Fatalf("expected exp=%d, got %d", active.ExpiresAt.Unix(), int64(expVal))
+	token := parseWithoutClaimsValidation(t, body["token"], &privateKey.PublicKey)
+
+	if token.Header["kid"] != "2" {
+		t.Fatalf("expected kid 2, got %v", token.Header["kid"])
 	}
 }
 
-func TestAuthExpiredParamIssuesExpiredJWT(t *testing.T) {
+func TestAuthReturnsExpiredJWTWhenRequested(t *testing.T) {
+	database := setupTestDB(t)
+	defer database.Close()
+
 	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC)
 
-	ks, _ := jwks.NewKeySet(
-		jwks.KeySpec{ExpiresAt: now.Add(30 * time.Minute)},  // active
-		jwks.KeySpec{ExpiresAt: now.Add(-30 * time.Minute)}, // expired
-	)
-	s := NewServer(ks)
+	s := NewServer(database)
 	s.now = func() time.Time { return now }
 
 	req := httptest.NewRequest(http.MethodPost, "/auth?expired=true", nil)
@@ -149,53 +168,33 @@ func TestAuthExpiredParamIssuesExpiredJWT(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
 
-	var body struct {
-		Token string `json:"token"`
-	}
+	var body map[string]string
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Token == "" {
-		t.Fatalf("expected token")
+		t.Fatal(err)
 	}
 
-	expired, ok := ks.ExpiredKey(now)
-	if !ok {
-		t.Fatalf("expected expired key")
+	record, err := dbpkg.GetExpiredKey(database, now.Unix())
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	parsed := parseWithoutClaimsValidation(t, body.Token, expired.Public)
-
-	kid, _ := parsed.Header["kid"].(string)
-	if kid != expired.KID {
-		t.Fatalf("expected kid %s, got %s", expired.KID, kid)
+	privateKey, err := dbpkg.ParsePrivateKeyFromPEM(record.PEM)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	claims, ok := parsed.Claims.(jwt.MapClaims)
-	if !ok {
-		t.Fatalf("expected MapClaims")
-	}
+	token := parseWithoutClaimsValidation(t, body["token"], &privateKey.PublicKey)
 
-	expVal, ok := claims["exp"].(float64)
-	if !ok {
-		t.Fatalf("expected exp claim")
-	}
-
-	if int64(expVal) != expired.ExpiresAt.Unix() {
-		t.Fatalf("expected exp=%d, got %d", expired.ExpiresAt.Unix(), int64(expVal))
-	}
-
-	if expired.ExpiresAt.After(now) {
-		t.Fatalf("expired key should expire in the past")
+	if token.Header["kid"] != "1" {
+		t.Fatalf("expected kid 1, got %v", token.Header["kid"])
 	}
 }
 
 func TestAuthMethodNotAllowed(t *testing.T) {
-	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC)
+	database := setupTestDB(t)
+	defer database.Close()
 
-	ks, _ := jwks.NewKeySet(jwks.KeySpec{ExpiresAt: now.Add(1 * time.Hour)})
-	s := NewServer(ks)
-	s.now = func() time.Time { return now }
+	s := NewServer(database)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth", nil)
 	rr := httptest.NewRecorder()
@@ -203,5 +202,87 @@ func TestAuthMethodNotAllowed(t *testing.T) {
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", rr.Code)
+	}
+}
+
+func TestAuthReturnsServerErrorWhenNoValidKeyExists(t *testing.T) {
+	database, err := dbpkg.OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if err := dbpkg.InitSchema(database); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC).Unix()
+
+	expiredPEM, err := dbpkg.GeneratePEMKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := dbpkg.InsertKey(database, expiredPEM, now-3600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(database)
+	s.now = func() time.Time { return time.Unix(now, 0).UTC() }
+
+	req := httptest.NewRequest(http.MethodPost, "/auth", nil)
+	rr := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestJWKSReturnsEmptyArrayWhenNoValidKeysExist(t *testing.T) {
+	database, err := dbpkg.OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if err := dbpkg.InitSchema(database); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 2, 7, 1, 0, 0, 0, time.UTC).Unix()
+
+	expiredPEM, err := dbpkg.GeneratePEMKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := dbpkg.InsertKey(database, expiredPEM, now-3600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(database)
+	s.now = func() time.Time { return time.Unix(now, 0).UTC() }
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
+	rr := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, ok := body["keys"].([]any)
+	if !ok {
+		t.Fatal(`expected "keys" array`)
+	}
+
+	if len(keys) != 0 {
+		t.Fatalf("expected 0 valid keys, got %d", len(keys))
 	}
 }

@@ -3,32 +3,28 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
-	"time"
 
-	"jwks-server/internal/jwks"
+	"jwks-server/internal/db"
 	"jwks-server/internal/server"
 )
 
 func main() {
-	now := time.Now().UTC()
-
-	// One active key (expires in future), one expired key (expiry in past)
-	keyset, err := jwks.NewKeySet(
-		jwks.KeySpec{ExpiresAt: now.Add(1 * time.Hour)},
-		jwks.KeySpec{ExpiresAt: now.Add(-1 * time.Hour)},
-	)
+	database, err := db.OpenDB("totally_not_my_privateKeys.db")
 	if err != nil {
-		log.Fatalf("failed to create keyset: %v", err)
+		log.Fatalf("failed to open db: %v", err)
+	}
+	defer database.Close()
+
+	if err := db.InitSchema(database); err != nil {
+		log.Fatalf("failed to initialize schema: %v", err)
 	}
 
-	srv := server.NewServer(keyset)
-
-	addr := ":8080"
-	if v := os.Getenv("ADDR"); v != "" {
-		addr = v
+	if err := db.EnsureSeedKeys(database); err != nil {
+		log.Fatalf("failed to seed keys: %v", err)
 	}
 
-	log.Printf("JWKS server listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, srv.Routes()))
+	srv := server.NewServer(database)
+
+	log.Println("JWKS server listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", srv.Routes()))
 }
